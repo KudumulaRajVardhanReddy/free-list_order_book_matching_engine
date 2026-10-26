@@ -5,6 +5,7 @@
 #include "orderbook/FreeList.hpp"
 #include "orderbook/PriceLevel.hpp"
 #include "orderbook/OrderBook.hpp"
+#include "orderbook/Rdtsc.hpp"
 
 #include <iostream>
 #include <chrono>
@@ -14,123 +15,125 @@
 #include <iomanip>
 
 using namespace orderbook;
+constexpr size_t BATCH_SIZE = 1000;
 
-// Add only Benchmark
-void benchmark_add_only(size_t iterations) {
-    Orderbook<1000000> book;
-    std::vector<double> latencies_ns;
-    latencies_ns.reserve(iterations);
+void benchmark_add_only_batched(size_t total_batches) {
+    OrderBook<1000000> book;
+    std::vector<double> cycles_per_op;
+    cycles_per_op.reserve(total_batches);
 
-    // Cache warming
+    // Warmup
     for (size_t i = 1; i <= 1000; ++i) book.add_order(i, 10000 + (i % 100), 10, Side::Buy, OrderType::Limit);
 
-    for (size_t i = 1001; i <= 1000 + iterations; ++i) {
-        auto start = std::chrono::high_resolution_clock::now();
+    OrderId order_id = 1001;
 
-        book.add_order(i, 10000 + (i % 100), 10, Side::Buy, OrderType::Limit);
+    for (size_t b = 0; b < total_batches; ++b) {
+        uint64_t t0 = rdtsc_start();
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::nano> elapsed = end - start;
-        latencies_ns.push_back(elapsed.count());
+        for (size_t i = 0; i < BATCH_SIZE; ++i) book.add_order(order_id++, 10000 + (i % 100), 10, Side::Buy, OrderType::Limit);
+
+        uint64_t t1 = rdtsc_end();
+
+        double cycles_batch = static_cast<double>(t1 - t0);
+        cycles_per_op.push_back(cycles_batch / static_cast<double>(BATCH_SIZE));
     }
 
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-
-    double sum = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0);
-    double avg = sum / iterations;
+    std::sort(cycles_per_op.begin(), cycles_per_op.end());
+    double sum = std::accumulate(cycles_per_op.begin(), cycles_per_op.end(), 0.0);
+    double avg_cycles = sum / total_batches;
 
     std::cout << "\n\n";
-    std::cout << "ISOLATED ADD_ORDER BENCHMARK (" << iterations << " ops)";
+    std::cout << "BATCHED ADD_ORDER BENCHMARK (" << (total_batches * BATCH_SIZE) << " ops)";
     std::cout << "\n\n";
-    std::cout << "Avg Latency: " << std::fixed << std::setprecision(2) << avg << " ns/op\n";
-    std::cout << "Throughout: " << (1000.0 / avg) << " Million ops/sec\n";
+    std::cout << "Avg Cycles/Op: " << std::fixed << std::setprecision(2) << avg_cycles << " cycles\n";
+    std::cout << "p50 Cycles/Op: " << cycles_per_op[static_cast<size_t>(total_batches * 0.50)] << " cycles\n";
+    std::cout << "p99 Cycles/Op: " << cycles_per_op[static_cast<size_t>(total_batches * 0.99)] << " cycles\n";
     std::cout << "\n\n";
 }
 
-// Add + Cancel Pair Benchmark
-void benchmark_add_cancel_hotpath(size_t iterations) {
-    Orderbook<100000> book;
-    std::vector<double> latencies_ns;
-    latencies_ns.reserve(iterations);
+void benchmark_add_cancel_batched(size_t total_batches) {
+    OrderBook<100000> book;
+    std::vector<double> cycles_per_pair;
+    cycles_per_pair.reserve(total_batches);
 
+    // Warmup
     for (size_t i = 1; i <= 1000; ++i) {
         book.add_order(i, 10000, 100, Side::Buy, OrderType::Limit);
         book.cancel_order(i);
     }
 
-    for (size_t i = 1001; i <= 1000 + iterations; ++i) {
-        auto start = std::chrono::high_resolution_clock::now();
+    OrderId order_id = 1001;
 
-        book.add_order(i, 10000, 100, Side::Buy, OrderType::Limit);
-        book.cancel_order(i);
+    for (size_t b = 0; b < total_batches; ++b) {
+        uint64_t t0 = rdtsc_start();
 
-        auto end = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < BATCH_SIZE; ++i) {
+            OrderId id = order_id++;
+            book.add_order(id, 10000, 100, Side::Buy, OrderType::Limit);
+            book.cancel_order(id);
+        }
 
-        std::chrono::duration<double, std::nano> elapsed = end - start;
-        latencies_ns.push_back(elapsed.count());
+        uint64_t t1 = rdtsc_end();
+
+        double cycles_batch = static_cast<double>(t1 - t0);
+        cycles_per_pair.push_back(cycles_batch / static_cast<double>(BATCH_SIZE));
     }
 
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-    double sum = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0);
-
-    double avg_pair_latency = sum / iterations;
-
-    double avg_per_op_latency = avg_pair_latency / 2.0;
-    double total_ops = static_cast<double>(iterations * 2);
-    double total_time_sec = sum / 1e9;
-    double throughput_mops = (total_ops / total_time_sec) / 1e6;
-
-    double p50_pair = latencies_ns[static_cast<size_t>(iterations * 0.5)];
-    double p99_pair = latencies_ns[static_cast<size_t>(iterations * 0.99)];
+    std::sort(cycles_per_pair.begin(), cycles_per_pair.end());
+    double sum = std::accumulate(cycles_per_pair.begin(), cycles_per_pair.end(), 0.0);
+    double avg_pair_cycles = sum / total_batches;
+    double avg_single_op_cycles = avg_pair_cycles / 2.0;
 
     std::cout << "\n\n";
-    std::cout << "ADD + CANCEL PAIR BENCHMARK (" << iterations << " pairs = " << (iterations * 2) << " ops)\n";
+    std::cout << "BATCHED ADD + CANCEL BENCHMARK (" << (total_batches * BATCH_SIZE) << " pairs)";
     std::cout << "\n\n";
-    std::cout << "Avg Pair Latency:   " << avg_pair_latency << " ns/pair\n";
-    std::cout << "Avg Op Latency:     " << avg_per_op_latency << " ns/op\n";
-    std::cout << "p50 (Pair Window):  " << p50_pair << " ns\n";
-    std::cout << "p99 (Pair Window):  " << p99_pair << " ns\n";
-    std::cout << "Pairs Throughput:   " << (1000.0 / avg_pair_latency) << " M pairs/sec";
-    std::cout << "Raw Ops Throughput: " << throughput_mops << " Million ops/sec\n";
+    std::cout << "Avg Cycles/Pair: " << avg_pair_cycles << " cycles\n";
+    std::cout << "Avg Cycles/Op:   " << avg_single_op_cycles << " cycles\n";
+    std::cout << "p50 Cycles/Pair: " << cycles_per_pair[static_cast<size_t>(total_batches * 0.50)] << " cycles\n";
+    std::cout << "p99 Cycles/Pair: " << cycles_per_pair[static_cast<size_t>(total_batches * 0.99)] << " cycles\n";
     std::cout << "\n\n";
 }
 
-void benchmark_crossing_match(size_t iterations) {
-    Orderbook<1000000> book;
-    std::vector<double> latencies_ns;
-    latencies_ns.reserve(iterations);
+void benchmark_crossing_match_batched(size_t total_batches) {
+    OrderBook<1000000> book;
+    std::vector<double> cycles_per_fill;
+    cycles_per_fill.reserve(total_batches);
 
+    // Warmup
     for (size_t i = 1; i <= 1000; ++i) book.add_order(i, 10050, 10, Side::Sell, OrderType::Limit);
 
     OrderId ask_id = 1001;
     OrderId bid_id = 1000001;
 
-    for (size_t i = 0; i < iterations; ++i) {
-        book.add_order(ask_id++, 10050, 100, Side::Sell, OrderType::Limit);
-        auto start = std::chrono::high_resolution_clock::now();
+    for (size_t b = 0; b < total_batches; ++b) {
 
-        book.add_order(bid_id++, 10050, 100, Side::Buy, OrderType::Limit);
+        for (size_t i = 0; i < BATCH_SIZE; ++i) book.add_order(ask_id++, 10050, 100, Side::Sell, OrderType::Limit);
 
-        auto end = std::chrono::high_resolution_clock::now();
+        uint64_t t0 = rdtsc_start();
 
-        std::chrono::duration<double, std::nano> elapsed = end - start;
-        latencies_ns.push_back(elapsed.count());
+        for (size_t i = 0; i < BATCH_SIZE; ++i) book.add_order(bid_id++, 10050, 100, Side::Buy, OrderType::Limit);
+
+        uint64_t t1 = rdtsc_end();
+
+        double cycles_batch = static_cast<double>(t1 - t0);
+        cycles_per_fill.push_back(cycles_batch / static_cast<double>(BATCH_SIZE));
     }
 
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-    double sum = std::accumulate(latencies_ns.begin(), latencies_ns.end(), 0.0);
-    double avg = sum / iterations;
+    std::sort(cycles_per_fill.begin(), cycles_per_fill.end());
+    double sum = std::accumulate(cycles_per_fill.begin(), cycles_per_fill.end(), 0.0);
+    double avg_cycles = sum / total_batches;
 
     std::cout << "\n\n";
-    std::cout << "CROSSING MATCH LOOP BENCHMARK (" << iterations << " fills)";
+    std::cout << "BATCHED CROSSING MATCH BENCHMARK (" << (total_batches * BATCH_SIZE) << " fills)";
     std::cout << "\n\n";
-    std::cout << "Avg Match Latency: " << avg << " ns/fill\n";
-    std::cout << "Fill Throughput:   " << (1000.0 / avg) << " Million fills/sec\n";
+    std::cout << "Avg Cycles/Fill: " << avg_cycles << " cycles\n";
+    std::cout << "p50 Cycles/Fill: " << cycles_per_fill[static_cast<size_t>(total_batches * 0.50)] << " cycles\n";
+    std::cout << "p99 Cycles/Fill: " << cycles_per_fill[static_cast<size_t>(total_batches * 0.99)] << " cycles\n";
     std::cout << "\n\n";
 }
 
 int main() {
-    benchmark_add_only(500'000);
-    benchmark_add_cancel_hotpath(1'000'000);
-    benchmark_crossing_match(500'000);
+    benchmark_add_only_batched(1000);
+    benchmark_add_cancel_batched(1000);
+    benchmark_crossing_match_batched(1000);
 }
