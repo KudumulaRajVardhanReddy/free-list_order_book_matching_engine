@@ -1,24 +1,51 @@
-// Orderbook.hpp
+// OrderBook.hpp
+
+#pragma once
 
 #include "Types.hpp"
 #include "Order.hpp"
 #include "FreeList.hpp"
 #include "PriceLevel.hpp"
-#include <map>
-#include <unordered_map>
-#include <functional>
+
+#include <cstdint>
 #include <cassert>
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <bit>
 
 namespace orderbook {
 
-template <size_t MaxOrders = 100000>
+/**
+ * Uses a flat array mapping coupled with a hierarchical 64-bit bitmask index
+ * for deterministic O(1) matching, insertions, cancellations, and best-price tracking.
+ */
+template <size_t MaxOrders = 100000, Price MaxPrice = 200000>
 class OrderBook {
+private:
+    static constexpr size_t BITS_PER_WORD = 64;
+    static constexpr size_t BITMASK_SIZE = (MaxPrice + BITS_PER_WORD) / BITS_PER_WORD;
+
 public:
-    OrderBook() = default;
+    static constexpr Price INVALID_ASK_PRICE = MaxPrice + 1;
 
-    bool add_order(OrderId id, Price price, Quantity qty, Side side, OrderType type = OrderType::Limit) noexcept {
+public:
+    OrderBook() {
+        order_lookup_.fill(nullptr);
+        bid_bitmask_.fill(0);
+        ask_bitmask_.fill(0);
+    }
 
-        if (order_lookup_.find(id) != order_lookup_.end() || !qty) [[unlikely]] return false;
+    // Disabling copy/move operations
+    OrderBook(const OrderBook&) = delete;
+    OrderBook& operator=(const OrderBook&) = delete;
+    OrderBook(OrderBook&&) = delete;
+    OrderBook& operator=(OrderBook&&) = delete;
+
+    [[nodiscard]] bool add_order(OrderId id, Price price, Quantity qty, Side side, OrderType type = OrderType::Limit) noexcept {
+        if (id == 0 || id > MaxOrders || price == 0 || price > MaxPrice || qty == 0) [[unlikely]] return false;
+
+        if (order_lookup_[id] != nullptr) [[unlikely]] return false;
 
         Order* incoming = free_list_.allocate();
         if (!incoming) [[unlikely]] return false;
@@ -27,92 +54,182 @@ public:
         match_order(incoming);
 
         if (incoming->quantity > 0 && incoming->type == OrderType::Limit) {
-            if (incoming->side == Side::Buy) bids_[incoming->price].push_back(incoming);
-            else asks_[incoming->price].push_back(incoming);
-            order_lookup_[incoming->id] = incoming;
+            const Price p = incoming->price;
+            if (incoming->side == Side::Buy) {
+                bids_[p].push_back(incoming);
+                set_bit(bid_bitmask_, p);
+                if (p > best_bid_price_) best_bid_price_ = p;
+            }
+            else {
+                asks_[p].push_back(incoming);
+                set_bit(ask_bitmask_, p);
+                if (p < best_ask_price_) best_ask_price_ = p;
+            }
+
+            order_lookup_[id] = incoming;
+            ++active_orders_count_;
         }
-        else if (!incoming->quantity || incoming->type == OrderType::Market) free_list_.deallocate(incoming);
+        else free_list_.deallocate(incoming);
 
         return true;
     }
 
-    bool cancel_order(OrderId id) noexcept {
-        auto it = order_lookup_.find(id);
-        if (it == order_lookup_.end()) [[unlikely]] return false;
+    [[nodiscard]] bool cancel_order(OrderId id) noexcept {
+        if (id == 0 || id > MaxOrders) [[unlikely]] return false;
 
-        Order* order = it->second;
-        order_lookup_.erase(it);
+        Order* order = order_lookup_[id];
+        if (order == nullptr) [[unlikely]] return false;
+
+        const Price p = order->price;
+        order_lookup_[id] = nullptr;
 
         if (order->side == Side::Buy) {
-            auto level_it = bids_.find(order->price);
-            if (level_it != bids_.end()) {
-                level_it->second.remove(order);
-
-                if (level_it->second.empty()) bids_.erase(level_it);
+            bids_[p].remove(order);
+            if (bids_[p].empty()) {
+                clear_bit(bid_bitmask_, p);
+                if (p == best_bid_price_) update_best_bid();
             }
-        }
-        else {
-            auto level_it = asks_.find(order->price);
-            if (level_it != asks_.end()) {
-                level_it->second.remove(order);
-                if (level_it->second.empty()) asks_.erase(level_it);
+        } else {
+            asks_[p].remove(order);
+            if (asks_[p].empty()) {
+                clear_bit(ask_bitmask_, p);
+                if (p == best_ask_price_) update_best_ask();
             }
         }
 
         free_list_.deallocate(order);
+        --active_orders_count_;
         return true;
     }
 
-    [[nodiscard]] bool empty() const noexcept { return order_lookup_.empty(); }
-    [[nodiscard]] size_t size() const noexcept { return order_lookup_.size(); }
+    [[nodiscard]] Price best_bid() const noexcept { return best_bid_price_; }
+    [[nodiscard]] Price best_ask() const noexcept { return best_ask_price_; }
+    [[nodiscard]] bool empty() const noexcept { return active_orders_count_ == 0; }
+    [[nodiscard]] size_t size() const noexcept { return active_orders_count_; }
 
 private:
-
     void match_order(Order* incoming) noexcept {
-        if (incoming->side == Side::Buy) match_against_book(incoming, asks_, std::less_equal<Price>{});
-        else match_against_book(incoming, bids_, std::greater_equal<Price>{});
-    }
+        if (incoming->side == Side::Buy) {
+            while (best_ask_price_ <= incoming->price && incoming->quantity > 0 && best_ask_price_ <= MaxPrice) {
+                PriceLevel& level = asks_[best_ask_price_];
+                Order* resting = level.head();
 
-    template<typename BookType, typename PriceComparator>
-    void match_against_book(Order* incoming, BookType& book, PriceComparator can_match) noexcept {
-        auto level_it = book.begin();
+                while (resting && incoming->quantity > 0) {
+                    Order* next_resting = resting->next;
+                    Quantity fill_qty = std::min(incoming->quantity, resting->quantity);
 
-        while (level_it != book.end() && incoming->quantity > 0) {
-            Price level_price = level_it->first;
+                    incoming->quantity -= fill_qty;
+                    resting->quantity -= fill_qty;
 
-            if (incoming->type == OrderType::Limit && !can_match(incoming->price, level_price)) break;
-
-            PriceLevel& level = level_it->second;
-            Order* resting = level.head();
-
-            while (resting && incoming->quantity > 0) {
-                Order* next_resting = resting->next;
-
-                Quantity fill_qty = std::min(incoming->quantity, resting->quantity);
-                incoming->quantity -= fill_qty;
-                resting->quantity -= fill_qty;
-
-                if (!resting->quantity) {
-                    level.remove(resting);
-                    order_lookup_.erase(resting->id);
-                    free_list_.deallocate(resting);
+                    if (resting->quantity == 0) {
+                        level.remove(resting);
+                        order_lookup_[resting->id] = nullptr;
+                        free_list_.deallocate(resting);
+                        --active_orders_count_;
+                    }
+                    resting = next_resting;
                 }
 
-                resting = next_resting;
+                if (level.empty()) {
+                    clear_bit(ask_bitmask_, best_ask_price_);
+                    update_best_ask();
+                }
             }
+        } else {
+            while (best_bid_price_ >= incoming->price && incoming->quantity > 0 && best_bid_price_ > 0) {
+                PriceLevel& level = bids_[best_bid_price_];
+                Order* resting = level.head();
 
-            if (level.empty()) level_it = book.erase(level_it);
-            else ++level_it;
+                while (resting && incoming->quantity > 0) {
+                    Order* next_resting = resting->next;
+                    Quantity fill_qty = std::min(incoming->quantity, resting->quantity);
+
+                    incoming->quantity -= fill_qty;
+                    resting->quantity -= fill_qty;
+
+                    if (resting->quantity == 0) {
+                        level.remove(resting);
+                        order_lookup_[resting->id] = nullptr;
+                        free_list_.deallocate(resting);
+                        --active_orders_count_;
+                    }
+                    resting = next_resting;
+                }
+
+                if (level.empty()) {
+                    clear_bit(bid_bitmask_, best_bid_price_);
+                    update_best_bid();
+                }
+            }
         }
+    }
+
+    inline void update_best_bid() noexcept {
+        if (best_bid_price_ == 0) return;
+
+        size_t word_idx = best_bid_price_ / BITS_PER_WORD;
+        uint64_t word = bid_bitmask_[word_idx];
+
+        if (word != 0) {
+            best_bid_price_ = static_cast<Price>((word_idx * BITS_PER_WORD) + (BITS_PER_WORD - 1 - std::countl_zero(word)));
+            return;
+        }
+
+        while (word_idx > 0) {
+            --word_idx;
+            if (bid_bitmask_[word_idx] != 0) {
+                best_bid_price_ = static_cast<Price>((word_idx * BITS_PER_WORD) + (BITS_PER_WORD - 1 - std::countl_zero(bid_bitmask_[word_idx])));
+                return;
+            }
+        }
+
+        best_bid_price_ = 0;
+    }
+
+    inline void update_best_ask() noexcept {
+        if (best_ask_price_ > MaxPrice) return;
+
+        size_t word_idx = best_ask_price_ / BITS_PER_WORD;
+        uint64_t word = ask_bitmask_[word_idx];
+
+        if (word != 0) {
+            best_ask_price_ = static_cast<Price>((word_idx * BITS_PER_WORD) + std::countr_zero(word));
+            if (best_ask_price_ > MaxPrice) [[unlikely]] best_ask_price_ = INVALID_ASK_PRICE;
+            return;
+        }
+
+        while (++word_idx < BITMASK_SIZE) {
+            if (ask_bitmask_[word_idx] != 0) {
+                best_ask_price_ = static_cast<Price>((word_idx * BITS_PER_WORD) + std::countr_zero(ask_bitmask_[word_idx]));
+                if (best_ask_price_ > MaxPrice) [[unlikely]] best_ask_price_ = INVALID_ASK_PRICE;
+                return;
+            }
+        }
+
+        best_ask_price_ = INVALID_ASK_PRICE;
+    }
+
+    static inline void set_bit(std::array<uint64_t, BITMASK_SIZE>& mask, Price price) noexcept {
+        mask[price / BITS_PER_WORD] |= (1ULL << (price % BITS_PER_WORD));
+    }
+
+    static inline void clear_bit(std::array<uint64_t, BITMASK_SIZE>& mask, Price price) noexcept {
+        mask[price / BITS_PER_WORD] &= ~(1ULL << (price % BITS_PER_WORD));
     }
 
 private:
     FreeList<MaxOrders> free_list_;
 
-    std::unordered_map<OrderId, Order*> order_lookup_;
+    std::array<Order*, MaxOrders + 1> order_lookup_;
+    std::array<PriceLevel, MaxPrice + 1> bids_;
+    std::array<PriceLevel, MaxPrice + 1> asks_;
 
-    std::map<Price, PriceLevel, std::greater<Price>> bids_;
-    std::map<Price, PriceLevel, std::less<Price>> asks_;
+    std::array<uint64_t, BITMASK_SIZE> bid_bitmask_;
+    std::array<uint64_t, BITMASK_SIZE> ask_bitmask_;
+
+    alignas(64) Price best_bid_price_{0};
+    alignas(64) Price best_ask_price_{INVALID_ASK_PRICE};
+    alignas(64) size_t active_orders_count_{0};
 };
 
-}
+} 
