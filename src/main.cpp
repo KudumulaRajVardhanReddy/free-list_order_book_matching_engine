@@ -9,6 +9,8 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <cassert>
+#include <memory>
 
 using namespace orderbook;
 
@@ -27,17 +29,16 @@ int main() {
     SPSCRingBuffer<OrderCommand, 1024> command_queue;
     std::atomic<bool> running{true};
 
-    // Single-Threaded Execution
     std::thread engine_thread([&command_queue, &running]() {
-        OrderBook<100000> book;
+        auto book = std::make_unique<OrderBook<100000, 200000>>();
         OrderCommand cmd;
 
         while (running) {
             if (command_queue.pop(cmd)) {
                 if (cmd.action == OrderCommand::Action::Add) {
-                    book.add_order(cmd.id, cmd.price, cmd.quantity, cmd.side, cmd.order_type);
+                    (void)book->add_order(cmd.id, cmd.price, cmd.quantity, cmd.side, cmd.order_type);
                 } else if (cmd.action == OrderCommand::Action::Cancel) {
-                    book.cancel_order(cmd.id);
+                    (void)book->cancel_order(cmd.id);
                 }
             } else {
                 std::this_thread::yield();
@@ -46,18 +47,17 @@ int main() {
 
         while (command_queue.pop(cmd)) {
             if (cmd.action == OrderCommand::Action::Add) {
-                book.add_order(cmd.id, cmd.price, cmd.quantity, cmd.side, cmd.order_type);
+                (void)book->add_order(cmd.id, cmd.price, cmd.quantity, cmd.side, cmd.order_type);
             } else if (cmd.action == OrderCommand::Action::Cancel) {
-                book.cancel_order(cmd.id);
+                (void)book->cancel_order(cmd.id);
             }
         }
 
-        std::cout << "[Engine] Final Book State size: " << book.size() << " resting order(s).\n";
+        std::cout << "[Engine] Final Book State size: " << book->size() << " resting order(s).\n";
     });
 
-        // Ingestion Thread Submitting Orders
     std::cout << "Submitting Limit Ask: Order #1 @ $100.50 (Qty: 50)...\n";
-    [[maybe_unused]] bool ok = command_queue.push(OrderCommand{OrderCommand::Action::Add, 1, 10050, 50, Side::Sell, OrderType::Limit});
+    bool ok = command_queue.push(OrderCommand{OrderCommand::Action::Add, 1, 10050, 50, Side::Sell, OrderType::Limit});
     assert(ok);
 
     std::cout << "Submitting Limit Ask: Order #2 @ $101.00 (Qty: 100)...\n";
@@ -83,6 +83,6 @@ int main() {
 
     if (engine_thread.joinable()) engine_thread.join();
 
-
     std::cout << "Engine execution completed cleanly.\n";
+    return 0;
 }
