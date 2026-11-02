@@ -70,6 +70,16 @@ Measures the true end-to-end traversal: Binary ITCH Parse $\to$ SPSC Push on Cor
 
 > **Note:** The ~360 cycle delta between the Service Latency and the Pipeline Roundtrip represents the physical silicon limit of Intel's inter-core cache invalidation protocol over the hardware bus.
 
+### 3. Bare-Metal Linux Hardware Profiling (`perf stat`)
+Captured using Linux `perf` pinned to physical P-cores via `taskset -c 2,4`:
+
+| Hardware Performance Counter | Measured Event Count | Technical Significance |
+| :--- | :--- | :--- |
+| **P-Core Execution (`cpu_core/cycles`)** | 543,780,977 | 100% execution pinned to Performance Cores |
+| **E-Core Execution (`cpu_atom/cycles`)** | 0 (`<not counted>`) | Confirms zero thread migration to Efficiency Cores |
+| **L1 Data Cache Misses** | 907,712 | ~9 L1 misses/msg (dominated by SPSC slot transfer) |
+| **Branch Misprediction Rate** | 2.34% (539,898 / 23.03M) | High branch predictor accuracy on matching hot-paths |
+
 ---
 
 ## What I improved from earlier iterations
