@@ -1,64 +1,87 @@
 # Order Book & Matching Engine
 
-A multithreaded order book matching engine implemented in C++20. The system utilizes lock-free concurrency primitives and pre-allocated object pools to ensure zero dynamic memory allocations on the execution path.
+A multithreaded order book matching engine implemented in C++20. The system utilizes lock-free concurrency primitives, pre-allocated object pools, and hardware-aware memory design to ensure zero dynamic allocations and ultra-low deterministic latency on the execution path.
 
 ## Technical Specifications
 
 ### Memory Management
-- **FreeList<Capacity>**: A custom object pool allocator. Initializes contiguous memory for order structures at startup. Order insertion and deletion fetch and return pointers to this pool in O(1) time, bypassing OS-level malloc/free or new/delete calls during runtime.
+
+* **FreeList**: A custom object pool allocator. Initializes contiguous memory for order structures at startup. Order insertion and deletion fetch and return pointers to this pool in $O(1)$ time, bypassing OS-level `malloc`/`free` or `new`/`delete` calls during runtime.
 
 ### Data Structures & Complexity
-- **Order Lookup (Flat Array)**: Maps `OrderId` directly to `Order*` via contiguous array indexing for deterministic O(1) lookup and state verification, replacing standard library hash maps.
-- **Price Levels**: Bids and asks are managed in ordered structures.
-- **Resting Orders (Intrusive Doubly Linked List)**: Each price level maintains an intrusive doubly linked list of `Order` nodes. This permits O(1) order cancellation and removal from the middle of a queue without traversing the list or requiring secondary pointer allocations.
 
-### Concurrency Model
-- **SPSCRingBuffer<T, Capacity>**: A Single-Producer Single-Consumer lock-free queue.
-- **Memory Ordering**: Uses `std::memory_order_acquire` and `std::memory_order_release` for thread synchronization.
-- **Cache Alignment**: Utilizes `alignas` (hardware destructive interference size, typically 64 bytes) on read/write indices to prevent false sharing across CPU cache lines.
-- **Thread Decoupling**: An ingestion thread passes by-value `OrderCommand` structs across the ring buffer. The matching engine thread consumes these commands and modifies the order book state sequentially.
+* **Order Lookup (Flat Array)**: Maps `OrderId` directly to `Order*` via contiguous array indexing for deterministic $O(1)$ lookup and state verification, replacing standard library hash maps.
+* **Price Level Indexing (Hierarchical Bitmask)**: Finding the next best available price level uses a 2-level $O(1)$ hierarchical bitmask. A 64-bit L2 summary mask combined with hardware intrinsics (`__builtin_ctzll` / `tzcnt`) instantly identifies populated price ranges, eliminating worst-case linear scanning across sparse books.
+* **Resting Orders (Intrusive Doubly Linked List)**: Each price level maintains an intrusive doubly linked list of `Order` nodes. This permits $O(1)$ order cancellation and removal from the middle of a queue without traversing the list or requiring secondary pointer allocations.
+
+### Concurrency & Pipeline Model
+
+* **Protocol Ingestion**: Includes a zero-allocation binary parser for the **NASDAQ ITCH 5.0** protocol (handling Add, Cancel, Execute messages).
+* **SPSCRingBuffer<T, Capacity>**: A Single-Producer Single-Consumer lock-free queue passing by-value commands between threads.
+* **Cache Alignment**: Utilizes `alignas(64)` on read/write indices to prevent false sharing and destructive interference across CPU cache lines.
+* **Thread Decoupling**: A pinned ingest thread parses binary feeds and pushes `OrderCommand` structs across the ring buffer. A pinned engine thread consumes these commands and modifies the book sequentially.
 
 ## Build Instructions
 
 The project uses CMake and requires a compiler supporting C++20.
 
 ```bash
-# Generate build files (Ninja or Make)
-mkdir build
-cd build
+# Generate build files
+mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 
 # Compile the application and benchmarks
-cmake --build . -j
+make -j$(nproc)
 ```
 
 ## Benchmark Results
 
-The benchmarking suite isolates the core execution paths of the engine. Measurements bypass OS timer quantization (`std::chrono`) by utilizing the hardware timestamp counter (`rdtsc`) to record elapsed CPU cycles.
+The benchmarking suite isolates both the core execution cost and the cross-core pipeline latency. Measurements bypass OS timer quantization by utilizing the hardware timestamp counter (`rdtsc`) to record elapsed CPU cycles for **every single operation** individually, exposing true tail-latency distributions instead of hiding spikes inside batched averages.
 
-To prevent aggressive Dead Code Elimination (DCE) and algebraic simplification by modern compilers (specifically GCC 15+), benchmarks utilize volatile variables for order parameters, hardware memory clobbers (`asm volatile("" ::: "memory")`), and state sinks to enforce execution.
+Benchmarks are run across isolated P-cores using `taskset -c 2,4` to measure pure L3 inter-core cache transfer (MESI invalidation) without queue depth saturation (head-of-line blocking).
 
 ### Environment
-- **Compiler**: GCC 15.2.0 (MinGW-w64)
-- **Target**: Release (-O3)
-- **OS**: Windows x86_64
-- **Measurement**: `rdtsc` (CPU Cycles)
 
-### Metrics
+* **Compiler**: GCC (Linux)
+* **Target**: Release (-O3, -march=native)
+* **OS**: Linux x86_64
+* **Measurement**: `rdtsc` (CPU Cycles)
 
-| Workload | Iterations | Avg Cycles/Op | p50 Cycles | p99 Cycles |
-| :--- | :--- | :--- | :--- | :--- |
-| **Batched Add Order (Limit Rests)** | 1,000,000 | 9.66 | 9.38 | 15.31 |
-| **Batched Add + Cancel (Pair)** | 1,000,000 | 98.08 (49.04/op) | 95.17 | 128.88 |
-| **Batched Crossing Match (Fill)** | 1,000,000 | 10.36 | 9.85 | 21.23 |
-| **Deep Book Sweep (5 Levels, 5 Orders)** | 10,000 | 100.36 (per sweep) | 85.00 | 114.00 |
+### 1. Consumer Service Latency (Core Execution)
 
-> **Note:** At a reference clock of 3.0 GHz, 10 CPU cycles equates to approximately 3.3 nanoseconds.
+Measures the exact execution cycles of the engine thread popping a command from the L1 cache, matching the order, and updating the L2 bitmask state.
 
-## Scope & Future Plans
+| Metric | CPU Cycles | Approx. Time (@ 5.0 GHz) |
+| --- | --- | --- |
+| **p50 (Median)** | 23 | ~4.6 ns |
+| **p90** | 24 | ~4.8 ns |
+| **p99** | 39 | ~7.8 ns |
+| **Max Spike** | 1,378 | ~275.6 ns |
 
-This iteration establishes the zero-allocation memory model, deterministic execution paths, and hardware-level benchmarking. Future development will focus on:
+### 2. Un-backlogged Pipeline Roundtrip (Wire-to-Book)
 
-- **Network Ingestion Layer**: Integrating a lock-free socket polling mechanism (e.g., epoll or io_uring) to feed the `SPSCRingBuffer`.
-- **Market Data Dissemination**: Implementing outbound multicast message generation for order book state updates (L2/L3 feeds) corresponding to execution events.
-- **NUMA Awareness**: Enforcing CPU core pinning and ensuring memory allocations are constrained to the local NUMA node of the matching thread to prevent cross-socket memory latency.
+Measures the true end-to-end traversal: Binary ITCH Parse $\to$ SPSC Push on Core 2 $\to$ L3 Interconnect MESI Transfer $\to$ Match Execution on Core 4 $\to$ Sync ACK.
+
+| Metric | CPU Cycles | Approx. Time (@ 5.0 GHz) |
+| --- | --- | --- |
+| **p50 (Median)** | 388 | ~77.6 ns |
+| **p90** | 414 | ~82.8 ns |
+| **p99** | 459 | ~91.8 ns |
+
+> **Note:** The ~360 cycle delta between the Service Latency and the Pipeline Roundtrip represents the physical silicon limit of Intel's inter-core cache invalidation protocol over the hardware bus.
+
+---
+
+## What I improved from earlier iterations
+
+1. **Eliminated Linear Price Scanning:**
+   * *Before:* Scanning for the next available price in a sparse limit order book relied on linear iteration, resulting in worst-case unbounded latency spikes.
+   * *After:* Implemented a two-level hierarchical bitmask. Hardware bit-scan-forward instructions (`tzcnt`) now locate the next populated price level in deterministic $O(1)$ time (~10-25 cycles).
+
+2. **Fixed Benchmark Methodology (Eliminated Batched Averages):**
+   * *Before:* Measured latency by timing batches of 1,000,000 operations and dividing by $N$. This critically masked tail-latency spikes and queueing delays.
+   * *After:* Transitioned to single-operation `rdtsc` timestamping and histogram generation. This exposed the true $p50 \to Max$ distribution, revealing the impact of C-state transitions and OS jitter.
+
+3. **True Pipeline Flow Control vs. Queue Backlog:**
+   * *Before:* Producers slammed the lock-free queue instantly, meaning measured latency was actually 99% queue waiting time (head-of-line blocking).
+   * *After:* Implemented paced, ping-pong pipeline benchmarking using real binary NASDAQ ITCH 5.0 payloads. This isolates the physical MESI cross-core cache transfer latency (~70-80ns) from artificial queue saturation.

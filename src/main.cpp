@@ -1,3 +1,5 @@
+// main.cpp
+
 #include "orderbook/Types.hpp"
 #include "orderbook/Order.hpp"
 #include "orderbook/FreeList.hpp"
@@ -84,5 +86,4 @@ int main() {
     if (engine_thread.joinable()) engine_thread.join();
 
     std::cout << "Engine execution completed cleanly.\n";
-    return 0;
 }
