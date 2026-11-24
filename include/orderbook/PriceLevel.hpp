@@ -44,6 +44,11 @@ public:
         order->next = nullptr;
     }
 
+    void reduce_volume(Quantity qty) noexcept {
+        assert(total_volume_ >= qty);
+        total_volume_ -= qty;
+    }
+
     [[nodiscard]] Order* head() const noexcept { return head_; }
     [[nodiscard]] Order* tail() const noexcept { return tail_; }
     [[nodiscard]] Quantity quantity() const noexcept { return total_volume_; }

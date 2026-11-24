@@ -124,6 +124,7 @@ private:
 
                     incoming->quantity -= fill_qty;
                     resting->quantity -= fill_qty;
+                    level.reduce_volume(fill_qty);
 
                     if (resting->quantity == 0) {
                         level.remove(resting);
@@ -150,6 +151,7 @@ private:
 
                     incoming->quantity -= fill_qty;
                     resting->quantity -= fill_qty;
+                    level.reduce_volume(fill_qty);
 
                     if (resting->quantity == 0) {
                         level.remove(resting);
@@ -228,7 +230,7 @@ private:
             if (best_ask_price_ > MaxPrice) [[unlikely]] best_ask_price_ = INVALID_ASK_PRICE;
             return;
         }
-        
+
         while (++l2_idx < L2_SIZE) {
             if (ask_summary_[l2_idx] != 0) {
                 size_t target_l1_idx = (l2_idx * BITS_PER_WORD) + std::countr_zero(ask_summary_[l2_idx]);
