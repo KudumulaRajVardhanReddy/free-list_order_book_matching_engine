@@ -23,7 +23,7 @@ class SPSCRingBuffer {
 public:
     SPSCRingBuffer() : write_index_(0), cached_write_index(0), read_index_(0), cached_read_index(0) {}
 
-    // Disable copy and move semantics on l-value.
+    // Disable copy and move semantics on l-value and r-values.
     SPSCRingBuffer(const SPSCRingBuffer&) = delete;
     SPSCRingBuffer& operator=(const SPSCRingBuffer&) = delete;
 
