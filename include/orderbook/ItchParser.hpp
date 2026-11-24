@@ -25,7 +25,7 @@ struct ItchHeader {
 struct AddOrderMessage {
     uint16_t stock_locate;
     uint16_t tracking_number;
-    uint64_t timestamp;
+    uint8_t timestamp[6];
     uint64_t order_reference_number;
     char buy_sell_indicator;
     uint32_t shares;
@@ -36,7 +36,7 @@ struct AddOrderMessage {
 struct OrderExecutedMessage {
     uint16_t stock_locate;
     uint16_t tracking_number;
-    uint64_t timestamp;
+    uint8_t timestamp[6];
     uint64_t order_reference_number;
     uint32_t executed_shares;
     uint64_t match_number;
@@ -45,7 +45,7 @@ struct OrderExecutedMessage {
 struct OrderCancelMessage {
     uint16_t stock_locate;
     uint16_t tracking_number;
-    uint64_t timestamp;
+    uint8_t timestamp[6];
     uint64_t order_reference_number;
     uint32_t canceled_shares;
 };
@@ -53,7 +53,7 @@ struct OrderCancelMessage {
 struct OrderDeleteMessage {
     uint16_t stock_locate;
     uint16_t tracking_number;
-    uint64_t timestamp;
+    uint8_t timestamp[6];
     uint64_t order_reference_number;
 };
 #pragma pack(pop)
