@@ -17,3 +17,6 @@ add_executable(benchmarks_app benchmarks/BenchmarkEngine.cpp)
 
 add_executable(itch_benchmark_app benchmarks/ItchReplayBenchmark.cpp)
 target_link_libraries(itch_benchmark_app PRIVATE pthread)
+
+add_executable(itch_day_replay benchmarks/ItchDayReplay.cpp)
+
